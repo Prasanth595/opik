@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 import rich.text
 from ..api_objects import types as api_types
@@ -181,101 +182,31 @@ def format_message_content(content: str | list[dict[str, Any]]) -> rich.text.Tex
     return result
 
 
-def content_to_string(content: str | list[dict[str, Any]]) -> str:
+def text_only_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a text summary for display or history; never use it as native model input."""
+    return [
+        {
+            **message,
+            "content": api_types.extract_text_from_content(message.get("content", "")),
+        }
+        for message in messages
+    ]
+
+
+_INLINE_MEDIA = re.compile(r"data:[^\s\"<>]*?;base64,[A-Za-z0-9+/=]+")
+
+
+def redact_inline_media(value: Any) -> Any:
+    """Return a text-safe summary for display, history and textual feedback.
+
+    Inline base64 media (data: URLs) becomes a short "[media]" marker; structure,
+    text and placeholder URLs such as "{image}" are kept. Native model requests are assembled separately by core.reasoning; original
+    messages and media are never changed by this summary.
     """
-    Convert message content to a string representation for diff display.
-
-    Args:
-        content: Message content, either a string or a list of content parts.
-
-    Returns:
-        String representation of the content.
-    """
-    if isinstance(content, str):
-        return content
-
-    parts: list[str] = []
-    for part in content:
-        part_type = part.get("type")
-        if part_type == "text":
-            text_content = part.get("text", "")
-            if text_content:
-                parts.append(f"[text] {text_content}")
-        elif part_type == "image_url":
-            url = _extract_url_from_part(part, "image_url")
-            parts.append(_format_url_for_string(url, "image_url", "data:image"))
-        elif part_type == "audio_url":
-            url = _extract_url_from_part(part, "audio_url")
-            parts.append(_format_url_for_string(url, "audio_url", "data:audio"))
-        elif part_type == "video_url":
-            url = _extract_url_from_part(part, "video_url")
-            parts.append(_format_url_for_string(url, "video_url", "data:video"))
-
-    return "\n".join(parts) if parts else "(empty content)"
-
-
-def preserve_multimodal_message_structure(
-    *,
-    original_messages: list[dict[str, Any]],
-    generated_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Preserve original multimodal content-part layout while applying generated text.
-
-    Current primary consumer: FewShotBayesianOptimizer prompt-template synthesis.
-    Other optimizers should call this only when they receive full rewritten message
-    arrays from an LLM and must keep original non-text parts stable.
-
-    For aligned message indices where role matches and original content is multimodal
-    (list of parts), this keeps non-text parts from the original message and replaces
-    only the text part with generated text. If generated text is empty, original text
-    is retained.
-    """
-    preserved: list[dict[str, Any]] = []
-    for index, generated in enumerate(generated_messages):
-        generated_role = generated.get("role")
-        generated_content = generated.get("content")
-        has_original_match = (
-            index < len(original_messages)
-            and original_messages[index].get("role") == generated_role
-        )
-        if not _has_non_empty_message_content(generated_content):
-            if has_original_match:
-                preserved.append(
-                    {
-                        "role": generated_role,
-                        "content": original_messages[index].get("content", ""),
-                    }
-                )
-            # If no matching original message exists, drop empty generated message.
-            continue
-
-        if has_original_match and isinstance(
-            original_messages[index].get("content"), list
-        ):
-            original_content = original_messages[index]["content"]
-            original_text = api_types.extract_text_from_content(original_content)
-            generated_content_raw = generated.get("content", "")
-            if isinstance(generated_content_raw, str) or isinstance(
-                generated_content_raw, list
-            ):
-                generated_text = api_types.extract_text_from_content(
-                    generated_content_raw
-                )
-            else:
-                generated_text = str(generated_content_raw)
-            if not generated_text.strip():
-                generated_text = original_text
-
-            preserved.append(
-                {
-                    "role": generated_role,
-                    "content": api_types.rebuild_content_with_new_text(
-                        original_content, generated_text
-                    ),
-                }
-            )
-            continue
-
-        preserved.append(generated)
-    return preserved
+    if isinstance(value, str):
+        return _INLINE_MEDIA.sub("[media]", value)
+    if isinstance(value, list):
+        return [redact_inline_media(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_inline_media(item) for key, item in value.items()}
+    return value

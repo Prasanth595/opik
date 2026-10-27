@@ -27,6 +27,7 @@ FinishReason = Literal[
     "max_trials",  # Maximum number of trials reached
     "no_improvement",  # No improvement for configured number of generations
     "reflection_budget",  # Reflection-LLM call budget exhausted (GEPA)
+    "timeout",  # Time limit reached before the trial budget (ParameterOptimizer)
     "error",  # Optimization failed
     "cancelled",  # Optimization cancelled/interrupted
 ]
@@ -135,6 +136,8 @@ def build_optimizer_metadata(
         "model": optimizer.model,
         "model_parameters": optimizer.model_parameters or None,
         "seed": getattr(optimizer, "seed", None),
+        "reasoning_input": getattr(optimizer, "reasoning_input", None),
+        "max_reasoning_examples": getattr(optimizer, "max_reasoning_examples", None),
         "num_threads": getattr(optimizer, "num_threads", None),
     }
 

@@ -12,7 +12,9 @@ import opik
 
 from ....api_objects.types import MetricFunction
 from ....utils import token as token_utils
+from ....utils.feedback import is_label_field
 from ....utils.logging import compact_debug_text, debug_log
+from ....utils.feedback import sanitize_feedback
 from ....utils import rng as rng_utils
 from .... import constants
 from .. import prompts as meta_prompts
@@ -70,29 +72,9 @@ def _resolve_input_fields(
     sample: dict[str, object],
     columns: list[str] | None,
 ) -> list[str]:
-    excluded_keys = {
-        "id",
-        "answer",
-        "label",
-        "output",
-        "expected_output",
-        "ground_truth",
-        "target",
-        "metadata",
-        "response",
-        "supporting_facts",
-    }
     inferred_label = _infer_label_field(dataset)
-    if inferred_label:
-        excluded_keys.add(inferred_label)
-    sensitive_pattern = re.compile(
-        r"(^|[_-])("
-        r"answer|gold|correct|target|label|output|ground|reference"
-        r")([_-]|$)"
-    )
-    all_input_fields = [k for k in sample.keys() if k not in excluded_keys]
     all_input_fields = [
-        k for k in all_input_fields if not sensitive_pattern.search(k.lower())
+        k for k in sample.keys() if k != inferred_label and not is_label_field(k)
     ]
     if columns is None:
         return all_input_fields
@@ -140,7 +122,7 @@ def _build_metric_context(
 
 
 def _normalize_value(value: object, max_value_length: int) -> str:
-    value_str = str(value).replace("\n", " ").replace("\r", " ")
+    value_str = str(sanitize_feedback(value)).replace("\n", " ").replace("\r", " ")
     value_str = re.sub(r"\s+", " ", value_str).strip()
     if len(value_str) > max_value_length:
         value_str = value_str[:max_value_length] + "..."

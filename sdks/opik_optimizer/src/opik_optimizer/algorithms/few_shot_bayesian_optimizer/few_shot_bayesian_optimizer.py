@@ -1,3 +1,9 @@
+from ...utils.feedback import sanitize_feedback
+from ...utils.prompt_editing import apply_text_edits, describe_text_segments
+
+from ...core.reasoning import render_case_message, ReasoningEvidence, EvidenceCase
+
+from typing import Literal
 from typing import Any, cast
 
 import copy
@@ -12,6 +18,10 @@ import optuna.samplers
 import optuna.pruners
 
 from opik import Dataset
+from opik.evaluation.evaluation_result import (
+    EvaluationResult,
+    EvaluationResultOnDictItems,
+)
 
 from ... import base_optimizer
 from ...core import llm_calls as _llm_calls
@@ -38,7 +48,6 @@ from ...utils.logging import debug_log
 from ...constants import normalize_eval_threads
 from ...utils.prompt_roles import apply_role_constraints, count_disallowed_role_updates
 from ...utils.scoring import improves_over
-from ...utils.multimodal import preserve_multimodal_message_structure
 from . import types
 from . import prompts as few_shot_prompts
 from .ops.columnarsearch_ops import ColumnarSearchSpace, build_columnar_search_space
@@ -77,7 +86,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         seed: Random seed for reproducibility
         enable_columnar_selection: Toggle column-aware example grouping (categorical Optuna params)
         enable_multivariate_tpe: Enable Optuna's multivariate TPE sampler (default: True)
-        enable_optuna_pruning: Enable Optuna pruner for early stopping (default: True)
+        enable_optuna_pruning: Deprecated, has no effect (trials report no
+            intermediate values, so a pruner could never act).
         prompt_overrides: Optional dict or callable to override/customize prompt templates.
             If a dict, keys should match DEFAULT_PROMPTS keys.
             If a callable, receives the PromptLibrary instance for in-place modification.
@@ -105,10 +115,12 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         enable_columnar_selection: bool = constants.FEW_SHOT_DEFAULT_ENABLE_COLUMNAR_SELECTION,
         enable_diversity: bool = constants.FEW_SHOT_DEFAULT_ENABLE_DIVERSITY,
         enable_multivariate_tpe: bool = constants.FEW_SHOT_DEFAULT_ENABLE_MULTIVARIATE_TPE,
-        enable_optuna_pruning: bool = constants.FEW_SHOT_DEFAULT_ENABLE_OPTUNA_PRUNING,
+        enable_optuna_pruning: bool | None = None,
         prompt_overrides: PromptOverrides = None,
         skip_perfect_score: bool = constants.DEFAULT_SKIP_PERFECT_SCORE,
         perfect_score: float = constants.DEFAULT_PERFECT_SCORE,
+        reasoning_input: Literal["multimodal", "text_only"] = "multimodal",
+        max_reasoning_examples: int = 5,
     ) -> None:
         super().__init__(
             model,
@@ -119,6 +131,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             skip_perfect_score=skip_perfect_score,
             perfect_score=perfect_score,
             prompt_overrides=prompt_overrides,
+            reasoning_input=reasoning_input,
+            max_reasoning_examples=max_reasoning_examples,
         )
         self.min_examples = min_examples
         self.max_examples = max_examples
@@ -127,7 +141,12 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         self.enable_columnar_selection = enable_columnar_selection
         self.enable_diversity = enable_diversity
         self.enable_multivariate_tpe = enable_multivariate_tpe
-        self.enable_optuna_pruning = enable_optuna_pruning
+        if enable_optuna_pruning is not None:
+            warnings.warn(
+                "enable_optuna_pruning is deprecated and has no effect.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if self.verbose == 0:
             logger.setLevel(logging.WARNING)
         elif self.verbose == 1:
@@ -150,7 +169,6 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             "enable_columnar_selection": self.enable_columnar_selection,
             "enable_diversity": self.enable_diversity,
             "enable_multivariate_tpe": self.enable_multivariate_tpe,
-            "enable_optuna_pruning": self.enable_optuna_pruning,
         }
 
     def evaluate_prompt(  # type: ignore[override]
@@ -167,10 +185,10 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         n_samples_strategy: str | None = None,
         seed: int | None = None,
         return_evaluation_result: bool = False,
-        allow_tool_use: bool = False,
+        allow_tool_use: bool | None = None,
         use_evaluate_on_dict_items: bool | None = None,
         sampling_tag: str | None = None,
-    ) -> float:
+    ) -> float | EvaluationResult | EvaluationResultOnDictItems:
         """
         Override evaluate_prompt to support custom evaluated_task.
 
@@ -189,12 +207,10 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
                 allow_tool_use=allow_tool_use,
                 use_evaluate_on_dict_items=use_evaluate_on_dict_items,
                 sampling_tag=sampling_tag,
+                return_evaluation_result=return_evaluation_result,
             )
 
-        # Default behavior: delegate to parent
-        # Note: This method always returns float, so we pass literal False
-        # to help mypy narrow the overload correctly
-        return super().evaluate_prompt(
+        return super().evaluate_prompt(  # type: ignore[call-overload,misc]
             prompt=prompt,
             dataset=dataset,
             metric=metric,
@@ -206,7 +222,7 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             n_samples=n_samples,
             n_samples_strategy=n_samples_strategy,
             seed=seed,
-            return_evaluation_result=False,
+            return_evaluation_result=return_evaluation_result,
             allow_tool_use=allow_tool_use,
             use_evaluate_on_dict_items=use_evaluate_on_dict_items,
             sampling_tag=sampling_tag,
@@ -223,7 +239,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         allow_tool_use: bool | None,
         use_evaluate_on_dict_items: bool | None,
         sampling_tag: str | None,
-    ) -> float:
+        return_evaluation_result: bool = False,
+    ) -> float | EvaluationResult | EvaluationResultOnDictItems:
         n_threads = normalize_eval_threads(n_threads or self.n_threads)
         if self._custom_evaluated_task is None:
             raise ValueError("Custom evaluated task is not set.")
@@ -248,6 +265,7 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             verbose=verbose,
             n_samples=self._custom_eval_n_samples,
             use_evaluate_on_dict_items=bool(use_evaluate_on_dict_items),
+            return_evaluation_result=return_evaluation_result,  # type: ignore[call-overload]
         )
 
     def get_config(self, context: OptimizationContext) -> dict[str, Any]:
@@ -322,13 +340,15 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             "prompts": [
                 {
                     "name": name,
-                    "messages": value.get_messages(),
+                    "segments": describe_text_segments(
+                        value, getattr(self, "_optimizable_roles", None)
+                    ),
                     # pass-tru for tools in final output for evaluation if included
                     "tools": toolcalling_utils.build_tool_blocks_from_prompt(value),
                 }
                 for name, value in prompts.items()
             ],
-            "examples": few_shot_examples,
+            "example_fields": list(few_shot_examples[0]) if few_shot_examples else [],
         }
 
         # Get templates from prompt library (allows for overrides)
@@ -367,6 +387,15 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         for attempt in range(2):
             try:
                 response_content = _llm_calls.call_model(
+                    evidence=ReasoningEvidence(
+                        prompts=prompts,
+                        cases=[
+                            EvidenceCase(case_id=str(i), inputs=example)
+                            for i, example in enumerate(
+                                few_shot_examples[: self.max_reasoning_examples]
+                            )
+                        ],
+                    ),
                     messages=attempt_messages,
                     model=model,
                     seed=self.seed,
@@ -398,22 +427,12 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         new_prompts: dict[str, chat_prompt.ChatPrompt] = {}
         for prompt_name in prompts.keys():
             try:
-                # Access field using getattr since field names are dynamic
-                messages = [
-                    x.model_dump(mode="json")
-                    for x in getattr(
-                        response_content, original_to_sanitized[prompt_name]
-                    )
-                ]
-                messages = preserve_multimodal_message_structure(
-                    original_messages=prompts[prompt_name].get_messages(),
-                    generated_messages=messages,
+                edits = getattr(response_content, original_to_sanitized[prompt_name])
+                new_prompt = apply_text_edits(
+                    prompts[prompt_name],
+                    edits,
+                    getattr(self, "_optimizable_roles", None),
                 )
-                new_prompt = prompts[prompt_name].copy()
-                # Store LLM-produced messages as-is to preserve placeholders.
-                # Role constraints are applied later in _reconstruct_prompts_with_examples
-                # when examples are actually injected into prompts.
-                new_prompt.set_messages(messages)
             except Exception as e:
                 logger.error(
                     f"Couldn't create prompt with placeholder for {prompt_name}: {e}"
@@ -600,8 +619,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             return datetime.now().isoformat()
 
         def optimization_objective(trial: optuna.Trial) -> float:
-            # Check should_stop flag at start of each trial
             if context.should_stop:
+                trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
 
             n_examples = trial.suggest_int(
@@ -651,8 +670,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
 
             llm_task = self._build_task_from_messages(
                 agent=agent,
-                prompts=prompts,
-                few_shot_examples=few_shot_examples,
+                prompts=prompts_with_examples,
+                few_shot_examples="",
                 allow_tool_use=context.allow_tool_use,
                 allowed_roles=(
                     context.extra_params.get("optimizable_roles")
@@ -729,8 +748,25 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             if columnar_choices:
                 trial_result_config["columnar_choices"] = columnar_choices
             trial.set_user_attr("parameters", dict(trial.params))
-            trial.set_user_attr("model_kwargs", copy.deepcopy(self.model_parameters))
-            trial.set_user_attr("model", self.model)
+            model_kwargs = {
+                name: copy.deepcopy(prompt.model_kwargs)
+                for name, prompt in prompts_with_examples.items()
+            }
+            models = {
+                name: prompt.model for name, prompt in prompts_with_examples.items()
+            }
+            trial.set_user_attr(
+                "model_kwargs",
+                next(iter(model_kwargs.values()))
+                if is_single_prompt_optimization
+                else model_kwargs,
+            )
+            trial.set_user_attr(
+                "model",
+                next(iter(models.values()))
+                if is_single_prompt_optimization
+                else models,
+            )
             trial.set_user_attr("stage", "few_shot")
             trial.set_user_attr("type", "bayesian")
             trial.set_user_attr("score", score)
@@ -747,6 +783,9 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
                 round_meta=_build_round_meta(trial),
                 candidate_id=f"trial{trial.number}",
             )
+            # Without this Optuna keeps running every remaining trial as a pruned no-op.
+            if context.should_stop:
+                trial.study.stop()
 
             return score
 
@@ -764,13 +803,8 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
             sampler = optuna.samplers.TPESampler(
                 seed=self.seed, multivariate=self.enable_multivariate_tpe
             )
-        pruner = (
-            optuna.pruners.MedianPruner(n_startup_trials=3)
-            if self.enable_optuna_pruning
-            else optuna.pruners.NopPruner()
-        )
         study = optuna.create_study(
-            direction="maximize", sampler=sampler, pruner=pruner
+            direction="maximize", sampler=sampler, pruner=optuna.pruners.NopPruner()
         )
 
         study.optimize(
@@ -947,7 +981,7 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         for example in demo_examples:
             processed_example = {}
             for key, value in example.items():
-                processed_example[key] = str(value)
+                processed_example[key] = str(sanitize_feedback(value))
 
             processed_demo_example = few_shot_prompt_template
             for key, value in processed_example.items():
@@ -964,6 +998,47 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
 
         few_shot_examples = "\n\n".join(processed_demo_examples)
         return few_shot_examples, processed_demo_examples
+
+    def _native_demonstrations(
+        self,
+        prompt: chat_prompt.ChatPrompt,
+        examples: list[dict[str, Any]],
+        template: str | None,
+        allowed_roles: set[str] | None,
+    ) -> list[dict[str, Any]]:
+        placeholder = str(self.get_prompt("example_placeholder"))
+        if template is None or not any(
+            placeholder in segment["text"]
+            for segment in describe_text_segments(prompt, allowed_roles)
+        ):
+            return []
+        demonstrations = []
+        has_images = False
+        for index, example in enumerate(examples):
+            message = render_case_message(
+                EvidenceCase(case_id=str(index), inputs=example), {prompt.name: prompt}
+            )
+            content = message["content"]
+            images = (
+                [part for part in content if part.get("type") == "image_url"]
+                if isinstance(content, list)
+                else []
+            )
+            has_images = has_images or bool(images)
+            text, _ = self._build_few_shot_examples_string([example], template)
+            demonstrations.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Demonstration example {index + 1}:\n{text}",
+                        },
+                        *images,
+                    ],
+                }
+            )
+        return demonstrations if has_images else []
 
     def _reconstruct_prompts_with_examples(
         self,
@@ -1003,10 +1078,18 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
         example_placeholder = str(self.get_prompt("example_placeholder"))
         for key, prompt in prompts_with_placeholder.items():
             new_prompt = prompt.copy()
+            native_demonstrations = self._native_demonstrations(
+                prompt, demo_examples or [], few_shot_prompt_template, allowed_roles
+            )
+            replacement = (
+                "Use the demonstration examples below."
+                if native_demonstrations
+                else few_shot_examples
+            )
             new_messages = new_prompt.replace_in_messages(
                 new_prompt.get_messages(),
                 example_placeholder,
-                few_shot_examples,
+                replacement,
             )
             constrained = apply_role_constraints(
                 prompt.get_messages(), new_messages, allowed_roles
@@ -1020,6 +1103,16 @@ class FewShotBayesianOptimizer(base_optimizer.BaseOptimizer):
                     dropped,
                     key,
                 )
+            if native_demonstrations:
+                task_index = max(
+                    (
+                        index
+                        for index, message in enumerate(constrained)
+                        if message.get("role") == "user"
+                    ),
+                    default=len(constrained),
+                )
+                constrained[task_index:task_index] = native_demonstrations
             new_prompt.set_messages(constrained)
             result_prompts[key] = new_prompt
 

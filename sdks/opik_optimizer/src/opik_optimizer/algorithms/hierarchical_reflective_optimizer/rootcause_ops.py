@@ -1,3 +1,4 @@
+from ...core.reasoning import ReasoningEvidence, cases_from_evaluation
 import logging
 import asyncio
 from typing import Any, cast
@@ -13,6 +14,7 @@ from . import reporting
 from ...utils.reporting import get_console
 from ...core import llm_calls as _llm_calls
 from ...utils.prompt_library import PromptLibrary
+from ...utils.feedback import _truncate, _format_agent_trace
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,7 @@ class HierarchicalRootCauseAnalyzer:
         test_results: list[Any],
         batch_start: int,
         batch_end: int,
+        traces: dict[str, Any] | None = None,
     ) -> str:
         """
         Format a batch of test results for analysis.
@@ -76,16 +79,21 @@ class HierarchicalRootCauseAnalyzer:
             test_results: Full list of test results
             batch_start: Starting index of the batch
             batch_end: Ending index of the batch (exclusive)
+            traces: Locally recorded trace trees by trace id, used to show the agent's steps
 
         Returns:
             Formatted string containing test result details
         """
+        traces = traces or {}
         formatted_results = []
 
         for idx in range(batch_start, min(batch_end, len(test_results))):
             test_result = test_results[idx]
             test_case = test_result.test_case
             dataset_item_id = test_case.dataset_item_id
+            dataset_item = test_case.dataset_item_content
+            if isinstance(dataset_item, dict):
+                dataset_item = {k: v for k, v in dataset_item.items() if k != "id"}
 
             # Extract scores
             scores_info = []
@@ -99,8 +107,15 @@ class HierarchicalRootCauseAnalyzer:
 
             # Format this test result
             result_text = f"""Test Case #{idx + 1} (ID: {dataset_item_id}, Trial: {test_result.trial_id})
+Dataset item: {_truncate(dataset_item)}
+Output: {_truncate(test_case.task_output)}
 Scores:
 {chr(10).join(scores_info)}"""
+
+            trace = traces.get(test_case.trace_id)
+            agent_trace = _format_agent_trace(trace) if trace is not None else ""
+            if agent_trace:
+                result_text += f"\nAgent trace:\n{agent_trace}"
 
             formatted_results.append(result_text)
 
@@ -120,6 +135,7 @@ Scores:
         batch_start: int,
         batch_end: int,
         project_name: str | None = None,
+        traces: dict[str, Any] | None = None,
     ) -> BatchAnalysis:
         """
         Analyze a single batch of test results asynchronously.
@@ -142,7 +158,7 @@ Scores:
         )
 
         formatted_batch = self._format_test_results_batch(
-            test_results, batch_start, batch_end
+            test_results, batch_start, batch_end, traces
         )
 
         batch_analysis_prompt = self.prompts.get(
@@ -152,6 +168,12 @@ Scores:
 
         # TODO: Check which project this data gets logged to
         root_cause_response = await _llm_calls.call_model_async(
+            evidence=ReasoningEvidence(
+                cases=cases_from_evaluation(
+                    test_results[batch_start:actual_end], traces=traces
+                ),
+                editable=False,
+            ),
             model=self.reasoning_model,
             messages=[{"role": "user", "content": batch_analysis_prompt}],
             seed=self.seed,
@@ -254,7 +276,10 @@ Scores:
             )
 
     async def analyze_async(
-        self, evaluation_result: EvaluationResult, project_name: str | None = None
+        self,
+        evaluation_result: EvaluationResult,
+        project_name: str | None = None,
+        traces: dict[str, Any] | None = None,
     ) -> HierarchicalRootCauseAnalysis:
         """
         Perform hierarchical root cause analysis on evaluation results asynchronously.
@@ -267,6 +292,8 @@ Scores:
 
         Args:
             evaluation_result: The evaluation result to analyze
+            traces: Optional trace trees by trace id; when present, each test case
+                includes the agent's steps (LLM and tool spans) for the analysis
 
         Returns:
             HierarchicalRootCauseAnalysis with unified failure modes and synthesis notes
@@ -295,6 +322,7 @@ Scores:
                 batch_start=batch_start,
                 batch_end=batch_end,
                 project_name=project_name,
+                traces=traces,
             )
             batch_tasks.append((batch_number, task))
             batch_number += 1
@@ -387,7 +415,10 @@ Scores:
         return hierarchical_analysis
 
     def analyze(
-        self, evaluation_result: EvaluationResult, project_name: str | None = None
+        self,
+        evaluation_result: EvaluationResult,
+        project_name: str | None = None,
+        traces: dict[str, Any] | None = None,
     ) -> HierarchicalRootCauseAnalysis:
         """
         Synchronous wrapper for analyze_async() for backward compatibility.
@@ -398,7 +429,9 @@ Scores:
         Returns:
             HierarchicalRootCauseAnalysis with unified failure modes and synthesis notes
         """
-        coro = self.analyze_async(evaluation_result, project_name=project_name)
+        coro = self.analyze_async(
+            evaluation_result, project_name=project_name, traces=traces
+        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

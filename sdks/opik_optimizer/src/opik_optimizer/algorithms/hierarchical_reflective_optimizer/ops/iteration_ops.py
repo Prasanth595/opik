@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import Any, TYPE_CHECKING
 
 import opik
@@ -9,7 +9,7 @@ import opik
 from ....api_objects import chat_prompt
 from ....api_objects.types import MetricFunction
 from ....constants import normalize_eval_threads
-from ....core import runtime
+from ....core import evaluation, runtime
 from ....core.state import OptimizationContext
 from ....utils.logging import debug_log
 from ....utils.reporting import convert_tqdm_to_rich
@@ -47,7 +47,23 @@ def run_root_cause_analysis(
                 if suppress_progress
                 else convert_tqdm_to_rich("  Evaluation", verbose=optimizer.verbose)
             )
-            with progress_ctx:
+            with progress_ctx, ExitStack() as recording_stack:
+                # Record the evaluation's trace trees so the analysis sees the agent's
+                # steps, not only its final output. Opik refuses nested recordings, and
+                # task-span metrics open their own inside evaluate().
+                recording = None
+                if not evaluation._metric_requires_task_span(metric):
+                    try:
+                        recording = recording_stack.enter_context(
+                            opik.record_traces_locally()
+                        )
+                    except Exception as exc:
+                        # Recording is optional; evaluation failures below still propagate.
+                        logger.debug(
+                            "Agent traces unavailable for analysis: %s",
+                            exc,
+                            exc_info=True,
+                        )
                 train_dataset_experiment_result = optimizer.evaluate_prompt(
                     prompt=best_prompts,
                     dataset=dataset,
@@ -63,8 +79,14 @@ def run_root_cause_analysis(
                     allow_tool_use=context.allow_tool_use,
                     sampling_tag=sampling_tag,
                 )
+                # Read before the recording closes: closing resets the local store.
+                traces = (
+                    {trace.id: trace for trace in recording.trace_trees}
+                    if recording is not None
+                    else None
+                )
             hierarchical_analysis = optimizer._hierarchical_root_cause_analysis(
-                train_dataset_experiment_result
+                train_dataset_experiment_result, traces
             )
             rca_reporter.set_completed(
                 hierarchical_analysis.total_test_cases,
@@ -115,7 +137,6 @@ def improve_over_failure_modes(
                         max_trials,
                         root_cause.name,
                     )
-                    optimizer._should_stop_optimization = True
                     break
 
                 trials_before_attempt = context.trials_completed
@@ -177,9 +198,8 @@ def improve_over_failure_modes(
                         verbose=optimizer.verbose,
                     )
 
-        if optimizer._should_stop_optimization or context.should_stop:
-            break
-
+        # Adopt before honouring a stop: the attempt that ended the run (perfect
+        # score, last trial) is the winner and must be the prompt we return.
         if (
             improved_score is not None
             and improved_chat_prompts is not None
@@ -200,6 +220,9 @@ def improve_over_failure_modes(
                 "Keeping previous best prompt, no improvement from '%s'",
                 root_cause.name,
             )
+
+        if context.should_stop:
+            break
 
     return best_prompts, best_score
 
@@ -254,7 +277,11 @@ def finalize_iteration(
         trials_completed=context.trials_completed,
     )
 
-    if abs(iteration_improvement) < optimizer.convergence_threshold:
+    # Don't overwrite an earlier stop reason (e.g. perfect_score) with convergence.
+    if (
+        not context.should_stop
+        and abs(iteration_improvement) < optimizer.convergence_threshold
+    ):
         logger.info(
             "Convergence achieved: improvement (%.2f%%) below threshold (%.2f%%). Stopping after %s iterations.",
             iteration_improvement * 100,
@@ -263,6 +290,5 @@ def finalize_iteration(
         )
         context.should_stop = True
         context.finish_reason = "no_improvement"
-        optimizer._should_stop_optimization = True
 
     return iteration_improvement

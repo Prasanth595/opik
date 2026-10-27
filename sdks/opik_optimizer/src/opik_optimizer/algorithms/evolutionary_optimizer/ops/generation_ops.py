@@ -7,13 +7,7 @@ import hashlib
 import json
 import logging
 
-try:
-    from deap import tools
-
-    _DEAP_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - exercised when DEAP is missing
-    tools = None
-    _DEAP_IMPORT_ERROR = exc
+from deap import tools
 
 from ....core.state import OptimizationContext
 from ....utils import display as display_utils
@@ -26,14 +20,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from ...evolutionary_optimizer import EvolutionaryOptimizer
 
 logger = logging.getLogger(__name__)
-
-
-def _require_deap() -> None:
-    if tools is None:
-        raise RuntimeError(
-            "DEAP is required for EvolutionaryOptimizer. "
-            "Install the optimizer extras that include DEAP."
-        ) from _DEAP_IMPORT_ERROR
 
 
 def build_deap_evaluator(
@@ -137,6 +123,7 @@ def initialize_population(
             verbose=optimizer.verbose,
             prompts=optimizer._prompts,
             optimizer=optimizer,
+            prompt_key=prompt_name,
         )
         prompt_variations[prompt_name] = variations
 
@@ -161,7 +148,6 @@ def evaluate_initial_population(
     best_primary_score_overall: float,
     best_prompts_overall: dict[str, Any],
 ) -> tuple[float, dict[str, Any]]:
-    _require_deap()
     optimizer._current_generation_idx = 0
     logger.debug("Evaluating initial population")
     fitnesses: list[Any] = list(
@@ -209,7 +195,6 @@ def post_population_round(
     best_prompts_overall: dict[str, Any],
     use_valid_index: bool,
 ) -> None:
-    _require_deap()
     population_ops.post_population_candidates(
         optimizer=optimizer,
         context=context,
@@ -257,7 +242,6 @@ def run_generation(
     hof: tools.HallOfFame,
     best_primary_score_overall: float,
 ) -> tuple[list[Any], int]:
-    _require_deap()
     optimizer._current_generation_idx = generation_idx
     best_gen_score = 0.0
     gen_rng = optimizer._derive_rng("generation", generation_idx)
@@ -365,7 +349,6 @@ def run_generations(
     initial_primary_score: float,
     max_trials: int,
 ) -> tuple[list[Any], float, dict[str, Any], int]:
-    _require_deap()
     generation_idx = 0
     with reporting.start_evolutionary_algo(verbose=optimizer.verbose) as evo_reporter:
         optimizer._set_reporter(evo_reporter)
@@ -425,16 +408,10 @@ def run_generations(
                 else:
                     optimizer._generations_without_overall_improvement += 1
 
-                if (
+                stagnated = (
                     optimizer._generations_without_overall_improvement
                     >= optimizer.DEFAULT_EARLY_STOPPING_GENERATIONS
-                ):
-                    logger.info(
-                        "No overall improvement for %d generations – early stopping at gen %d.",
-                        optimizer.DEFAULT_EARLY_STOPPING_GENERATIONS,
-                        generation_idx,
-                    )
-                    break
+                )
 
                 reporting.end_gen(
                     generation_idx,
@@ -481,6 +458,14 @@ def run_generations(
                         ),
                     },
                 )
+                # Checked after recording so the stagnant generation's round is kept.
+                if stagnated:
+                    logger.info(
+                        "No overall improvement for %d generations – early stopping at gen %d.",
+                        optimizer.DEFAULT_EARLY_STOPPING_GENERATIONS,
+                        generation_idx,
+                    )
+                    break
         finally:
             if context.finish_reason == "max_trials":
                 display_utils.display_message(

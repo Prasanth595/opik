@@ -1,3 +1,4 @@
+from typing import Literal
 import logging
 from typing import Any, cast
 
@@ -7,6 +8,7 @@ from ...core.state import AlgorithmResult, OptimizationContext
 from ...utils.prompt_library import PromptOverrides
 from ... import constants
 from ...api_objects.types import MetricFunction
+from ...api_objects import chat_prompt
 from ...utils import throttle as _throttle
 from ...utils.logging import debug_log
 from ...utils.scoring import improves_over
@@ -102,8 +104,12 @@ class MetaPromptOptimizer(BaseOptimizer):
         prompt_overrides: PromptOverrides = None,
         skip_perfect_score: bool = constants.DEFAULT_SKIP_PERFECT_SCORE,
         perfect_score: float = constants.DEFAULT_PERFECT_SCORE,
+        reasoning_input: Literal["multimodal", "text_only"] = "multimodal",
+        max_reasoning_examples: int = 5,
     ) -> None:
         super().__init__(
+            reasoning_input=reasoning_input,
+            max_reasoning_examples=max_reasoning_examples,
             model=model,
             verbose=verbose,
             seed=seed,
@@ -152,17 +158,7 @@ class MetaPromptOptimizer(BaseOptimizer):
             constants.META_PROMPT_DEFAULT_HALL_OF_FAME_PATTERN_INJECTION_RATE
         )
 
-        self.hall_of_fame: PromptHallOfFame | None = None
-        if self.use_hall_of_fame:
-            self.hall_of_fame = PromptHallOfFame(
-                max_size=self.hall_of_fame_size,
-                pattern_extraction_interval=self.pattern_extraction_interval,
-                prompts=self._prompts,
-            )
-            logger.debug(
-                f"Hall of Fame enabled: size={self.hall_of_fame_size}, "
-                f"extraction_interval={self.pattern_extraction_interval}"
-            )
+        self.hall_of_fame: PromptHallOfFame | None = self._new_hall_of_fame()
 
         logger.debug(f"Initialized MetaPromptOptimizer with model={model}")
         logger.debug(f"Prompts/round: {prompts_per_round}")
@@ -219,6 +215,15 @@ class MetaPromptOptimizer(BaseOptimizer):
             else None,
         }
 
+    def _new_hall_of_fame(self) -> PromptHallOfFame | None:
+        if not self.use_hall_of_fame:
+            return None
+        return PromptHallOfFame(
+            max_size=self.hall_of_fame_size,
+            pattern_extraction_interval=self.pattern_extraction_interval,
+            prompts=self._prompts,
+        )
+
     def run_optimization(
         self,
         context: OptimizationContext,
@@ -250,6 +255,8 @@ class MetaPromptOptimizer(BaseOptimizer):
 
         self.auto_continue = auto_continue
         self.dataset = dataset
+        # Prompts from an earlier run must not seed this one.
+        self.hall_of_fame = self._new_hall_of_fame()
         self.set_default_dataset_split(
             "validation" if context.validation_dataset is not None else "train"
         )
@@ -298,10 +305,6 @@ class MetaPromptOptimizer(BaseOptimizer):
                     )
                     from ...utils.display import display_tool_description
 
-                    if not is_single_prompt_optimization:
-                        raise ValueError(
-                            "Tool description optimization only supports single prompts."
-                        )
                     reporter = None
                     if self.verbose >= 1:
                         import json as _json
@@ -337,26 +340,40 @@ class MetaPromptOptimizer(BaseOptimizer):
                             )
 
                         reporter = _reporter
-                    single_candidates = (
-                        toolcalling_utils.generate_tool_description_candidates(
-                            optimizer=self,
-                            current_prompt=list(best_prompts.values())[0],
-                            best_score=best_score,
-                            round_num=round_num,
-                            previous_rounds=self.get_history_rounds(),
-                            metric=metric,
-                            optimization_id=optimization_id,
-                            project_name=self.project_name,
-                            build_history_context_fn=self._build_history_context,
-                            tool_names=tool_names,
-                            tool_description_reporter=reporter,
-                        )
+                    bundles_by_index: list[dict[str, chat_prompt.ChatPrompt]] = []
+                    selected_by_prompt = context.extra_params.get(
+                        "tool_names_by_prompt"
                     )
-                    prompt_key = next(iter(best_prompts.keys()))
-                    candidate_prompts = [
-                        {prompt_key: prompt}
-                        for prompt in single_candidates[:prompts_this_round]
-                    ]
+                    for prompt_key, current_prompt in best_prompts.items():
+                        if (
+                            selected_by_prompt is not None
+                            and prompt_key not in selected_by_prompt
+                        ):
+                            continue
+                        single_candidates = (
+                            toolcalling_utils.generate_tool_description_candidates(
+                                optimizer=self,
+                                current_prompt=current_prompt,
+                                best_score=best_score,
+                                round_num=round_num,
+                                previous_rounds=self.get_history_rounds(),
+                                metric=metric,
+                                optimization_id=optimization_id,
+                                project_name=self.project_name,
+                                build_history_context_fn=self._build_history_context,
+                                tool_names=selected_by_prompt[prompt_key]
+                                if selected_by_prompt is not None
+                                else tool_names,
+                                tool_description_reporter=reporter,
+                            )
+                        )
+                        for index, prompt in enumerate(
+                            single_candidates[:prompts_this_round]
+                        ):
+                            if index == len(bundles_by_index):
+                                bundles_by_index.append(dict(best_prompts))
+                            bundles_by_index[index][prompt_key] = prompt
+                    candidate_prompts = bundles_by_index
                 else:
                     candidate_prompts = candidate_ops.generate_round_candidates(
                         optimizer=self,

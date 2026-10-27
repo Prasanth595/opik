@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, cast, overload, Literal
 from collections.abc import Iterator
+import inspect
 import logging
 import traceback
 import warnings
 import time
 from abc import ABC
+from uuid import UUID
 import random
 import importlib.metadata
 
@@ -22,6 +24,7 @@ from opik.evaluation.evaluation_result import (
 )
 
 from .core import evaluation as task_evaluator
+from .core import llm_calls
 from .core import runtime
 from .core.evaluation import compute_scoring_health
 from .utils.display.run import OptimizationRunDisplay, RunDisplay
@@ -77,6 +80,15 @@ def _compute_scoring_health_from_result(
     return compute_scoring_health(objective_scores)
 
 
+def _copy_model_parameters(value: Any) -> Any:
+    """Copy nested dicts/lists; share other values (clients, callbacks) that may not be copyable."""
+    if isinstance(value, dict):
+        return {key: _copy_model_parameters(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_model_parameters(item) for item in value]
+    return value
+
+
 # Set up logging:
 logger = logging.getLogger(__name__)
 
@@ -92,6 +104,16 @@ class BaseOptimizer(ABC):
     supports_tool_optimization: bool = False
     supports_prompt_optimization: bool = False
     supports_multimodal: bool = False
+    uses_reasoning: bool = True
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Overridden entrypoints must keep the run's call scope (counters, project, tags).
+        for name in ("optimize_prompt", "optimize_parameter"):
+            method = cls.__dict__.get(name)
+            if inspect.isfunction(method):
+                setattr(cls, name, llm_calls.bind_optimizer(method))
+
     # ------------------------------------------------------------------
     # Input validation & setup
     # ------------------------------------------------------------------
@@ -109,6 +131,8 @@ class BaseOptimizer(ABC):
         perfect_score: float = 0.95,
         prompt_overrides: PromptOverrides = None,
         display: RunDisplay | None = None,
+        reasoning_input: Literal["multimodal", "text_only"] = "multimodal",
+        max_reasoning_examples: int = 5,
     ) -> None:
         """
         Base class for optimizers.
@@ -131,12 +155,27 @@ class BaseOptimizer(ABC):
                Dict: {"prompt_key": "new_template"} to override specific prompts.
                Callable: function(prompts: PromptLibrary) -> None to modify prompts programmatically.
            display: Optional display handler for run output (used for testing or alternate renderers).
+           reasoning_input: Native image evidence by default; text_only explicitly omits media from optimizer reasoning.
+           max_reasoning_examples: Maximum evaluation cases attached to a reasoning request.
         """
+        if reasoning_input not in {"multimodal", "text_only"}:
+            raise ValueError("reasoning_input must be 'multimodal' or 'text_only'")
+        if (
+            isinstance(max_reasoning_examples, bool)
+            or not isinstance(max_reasoning_examples, int)
+            or max_reasoning_examples < 1
+        ):
+            raise ValueError("max_reasoning_examples must be a positive integer")
+        self.reasoning_input = reasoning_input
+        self.max_reasoning_examples = max_reasoning_examples
+        self._reasoning_cases: tuple[Any, ...] = ()
         self.model = model
-        self.model_parameters = model_parameters or {}
+        self.model_parameters = _copy_model_parameters(model_parameters or {})
         self.reasoning_model = reasoning_model or model
-        self.reasoning_model_parameters = (
-            reasoning_model_parameters or self.model_parameters
+        self.reasoning_model_parameters = _copy_model_parameters(
+            self.model_parameters
+            if reasoning_model_parameters is None
+            else reasoning_model_parameters
         )
         self.verbose = verbose
         self.seed = seed
@@ -367,7 +406,8 @@ class BaseOptimizer(ABC):
             optimization_id: Optional pre-specified optimization ID
 
         Returns:
-            The created Optimization object, or None if creation failed
+            The created Optimization object, or None if automatic tracking failed.
+            When an optimization_id was explicitly requested, creation failures propagate.
         """
         try:
             opik_optimization = self.opik_client.create_optimization(
@@ -387,36 +427,11 @@ class BaseOptimizer(ABC):
             )
             return opik_optimization
         except Exception as e:
-            logger.warning(f"Opik server error: {e}. Continuing without Opik tracking.")
             self.current_optimization_id = None
+            if optimization_id is not None:
+                raise
+            logger.warning(f"Opik server error: {e}. Continuing without Opik tracking.")
             return None
-
-    def _select_evaluation_dataset(
-        self,
-        dataset: Dataset,
-        validation_dataset: Dataset | None,
-        warn_unsupported: bool = False,
-    ) -> Dataset:
-        """
-        Select which dataset to use for evaluation.
-
-        Args:
-            dataset: The training dataset
-            validation_dataset: Optional validation dataset
-            warn_unsupported: If True, log warning that validation_dataset is not supported
-
-        Returns:
-            The dataset to use for evaluation
-        """
-        if validation_dataset is not None:
-            if warn_unsupported:
-                logger.warning(
-                    f"{self.__class__.__name__} currently does not support validation dataset. "
-                    f"Using `dataset` (training) for now. Ignoring `validation_dataset` parameter."
-                )
-                return dataset
-            return validation_dataset
-        return dataset
 
     def _setup_optimization(
         self,
@@ -442,39 +457,14 @@ class BaseOptimizer(ABC):
         )
         optimizable_roles = normalize_optimizable_roles(optimize_prompts)
 
-        from .utils.toolcalling.ops import toolcalling as toolcalling_utils
-
-        optimize_tools = toolcalling_utils.validate_optimization_flags(
-            optimize_prompts=bool(optimizable_roles),
+        optimizable_prompts = self._prepare_tool_optimization(
+            optimizable_prompts,
+            is_single_prompt_optimization=is_single_prompt_optimization,
+            optimize_prompts=optimize_prompts,
+            optimizable_roles=optimizable_roles,
             optimize_tools=optimize_tools,
-            supports_tool_optimization=self.supports_tool_optimization,
-            warn_unsupported=True,
+            extra_params=extra_params,
         )
-        optimize_tools_provided = optimize_tools is not None
-        if optimize_tools_provided and not is_single_prompt_optimization:
-            raise ValueError(
-                "Tool description optimization only supports single prompts."
-            )
-        if optimize_tools_provided:
-            extra_params["optimize_tools"] = optimize_tools
-
-        tool_names: list[str] | None = None
-        if optimize_tools_provided and is_single_prompt_optimization:
-            single_prompt = next(iter(optimizable_prompts.values()))
-            resolved_prompt, tool_names = self._resolve_toolcalling(
-                single_prompt, optimize_tools=optimize_tools
-            )
-            resolved_prompt = cast(chat_prompt.ChatPrompt, resolved_prompt)
-            optimizable_prompts = {resolved_prompt.name: resolved_prompt}
-        else:
-            resolved_prompts, tool_names = self._resolve_toolcalling(
-                optimizable_prompts
-            )
-            optimizable_prompts = cast(
-                dict[str, chat_prompt.ChatPrompt], resolved_prompts
-            )
-        if tool_names is not None:
-            extra_params["tool_names"] = tool_names
 
         # Validate optimization inputs
         self._validate_optimization_inputs(
@@ -482,48 +472,59 @@ class BaseOptimizer(ABC):
         )
 
         # Select evaluation dataset early so we validate n_samples against the right split
-        evaluation_dataset = self._select_evaluation_dataset(
-            dataset, validation_dataset
+        evaluation_dataset = (
+            validation_dataset if validation_dataset is not None else dataset
         )
 
         self._validate_metric_requirements(evaluation_dataset, metric)
 
-        # Validate n_samples against evaluation dataset size
-        total_items = len(evaluation_dataset.get_items())
-        if total_items == 0:
-            raise ValueError(
-                f"dataset: {evaluation_dataset.name} is empty in project: {getattr(evaluation_dataset, 'project_name', None)}"
+        n_samples = self._validated_n_samples(evaluation_dataset, n_samples)
+        from .core.reasoning import EvidenceCase
+
+        self._reasoning_cases = tuple(
+            EvidenceCase(case_id=str(item.get("id", index)), inputs=item)
+            for index, item in enumerate(
+                evaluation_dataset.get_items()[: self.max_reasoning_examples]
             )
-        if isinstance(n_samples, int) and n_samples > total_items:
-            logger.warning(
-                "Requested n_samples (%s) is larger than evaluation dataset size (%s). "
-                "Using full evaluation dataset.",
-                n_samples,
-                total_items,
+        )
+
+        self._reasoning_prompts = optimizable_prompts
+        if self.uses_reasoning:
+            from .core.reasoning import (
+                ReasoningEvidence,
+                build_reasoning_messages,
+                validate_reasoning_messages,
             )
-            n_samples = None
+
+            preflight = build_reasoning_messages(
+                [],
+                evidence=ReasoningEvidence(
+                    prompts=optimizable_prompts, cases=self._reasoning_cases
+                ),
+                mode=self.reasoning_input,
+                allowed_roles=optimizable_roles,
+            )
+            for optimizer_model in {self.model, self.reasoning_model}:
+                validate_reasoning_messages(preflight, optimizer_model)
 
         # Resolve project name
         project_name = resolve_project_name(project_name)
         self.project_name = project_name
 
         # Create agent if not provided
+        custom_agent = agent is not None
         if agent is None:
             agent = LiteLLMAgent(project_name=project_name)
         self._attach_agent_owner(agent)
 
-        # Reset counters
+        # Reset per-run state: counters and the seeded RNG, so a reused optimizer
+        # repeats the same run for the same seed.
         self._reset_counters()
+        self._rng = rng_utils.make_rng(self.seed)
 
-        # Get existing optimization if provided
-        if optimization_id:
-            opik_optimization = self.opik_client.get_optimization_by_id(optimization_id)
-            self.current_optimization_id = opik_optimization.id
-            logger.debug(f"Using existing optimization with ID: {opik_optimization.id}")
-        else:
-            opik_optimization = self._create_optimization_run(
-                dataset, metric, optimization_id
-            )
+        opik_optimization = self._get_or_create_optimization(
+            dataset, metric, optimization_id
+        )
 
         # Default dataset split for history/logging (overridden by optimizers as needed)
         dataset_split = "validation" if validation_dataset is not None else "train"
@@ -549,7 +550,7 @@ class BaseOptimizer(ABC):
 
         extra_params["optimizable_roles"] = optimizable_roles
         self._optimizable_roles = optimizable_roles
-        if not optimizable_roles:
+        if not optimizable_roles and optimize_prompts is not False:
             logger.warning(
                 "optimize_prompts resolved to no roles; prompt content will not be mutated."
             )
@@ -557,11 +558,10 @@ class BaseOptimizer(ABC):
         if hasattr(self, "allow_user_prompt_optimization"):
             setattr(self, "allow_user_prompt_optimization", "user" in optimizable_roles)
 
-        # Return optimization context
-        allow_tool_use_flag = bool(extra_params.get("allow_tool_use", True))
-        allow_tool_use_flag = (
-            allow_tool_use_flag
-            and toolcalling_utils.should_allow_tool_use(optimizable_prompts)
+        allow_tool_use_flag = self._resolve_allow_tool_use(
+            optimizable_prompts,
+            requested=bool(extra_params.get("allow_tool_use", True)),
+            custom_agent=custom_agent,
         )
         extra_params["allow_tool_use"] = allow_tool_use_flag
 
@@ -593,13 +593,131 @@ class BaseOptimizer(ABC):
         self.n_samples_strategy = resolved_strategy
         return context
 
+    def _prepare_tool_optimization(
+        self,
+        optimizable_prompts: dict[str, chat_prompt.ChatPrompt],
+        *,
+        is_single_prompt_optimization: bool,
+        optimize_prompts: bool | str | list[str] | None,
+        optimizable_roles: set[str],
+        optimize_tools: bool | dict[str, bool] | None,
+        extra_params: dict[str, Any],
+    ) -> dict[str, chat_prompt.ChatPrompt]:
+        """Validate the tool flags, resolve tool selections and record them in extra_params."""
+        from .utils.toolcalling.ops import toolcalling as toolcalling_utils
+
+        # Declining tool optimization is valid for every prompt shape.
+        if not toolcalling_utils.tool_optimization_requested(optimize_tools):
+            optimize_tools = None
+        # optimize_prompts=False with no tools is a deliberate no-op on content
+        # (ParameterOptimizer); every other combination must be validated.
+        if optimize_prompts is not False or optimize_tools is not None:
+            optimize_tools = toolcalling_utils.validate_optimization_flags(
+                optimize_prompts=bool(optimizable_roles),
+                optimize_tools=optimize_tools,
+                supports_tool_optimization=self.supports_tool_optimization,
+                warn_unsupported=True,
+            )
+        if optimize_tools is not None:
+            extra_params["optimize_tools"] = optimize_tools
+
+        tool_names: list[str] | dict[str, list[str]] | None
+        if optimize_tools is not None and is_single_prompt_optimization:
+            single_prompt = next(iter(optimizable_prompts.values()))
+            resolved_prompt, tool_names = self._resolve_toolcalling(
+                single_prompt, optimize_tools=optimize_tools
+            )
+            resolved_prompt = cast(chat_prompt.ChatPrompt, resolved_prompt)
+            optimizable_prompts = {resolved_prompt.name: resolved_prompt}
+        else:
+            resolved_prompts, tool_names = self._resolve_toolcalling(
+                optimizable_prompts, optimize_tools=optimize_tools
+            )
+            optimizable_prompts = cast(
+                dict[str, chat_prompt.ChatPrompt], resolved_prompts
+            )
+        if isinstance(tool_names, dict):
+            extra_params["tool_names_by_prompt"] = tool_names
+            extra_params["tool_names"] = sorted(
+                {tool for names in tool_names.values() for tool in names}
+            )
+        elif tool_names is not None:
+            extra_params["tool_names"] = tool_names
+        return optimizable_prompts
+
+    @staticmethod
+    def _validated_n_samples(
+        evaluation_dataset: Dataset, n_samples: int | float | str | None
+    ) -> int | float | str | None:
+        """Reject an empty evaluation dataset and drop an n_samples larger than it."""
+        total_items = len(evaluation_dataset.get_items())
+        if total_items == 0:
+            raise ValueError(
+                f"dataset: {evaluation_dataset.name} is empty in project: {getattr(evaluation_dataset, 'project_name', None)}"
+            )
+        if isinstance(n_samples, int) and n_samples > total_items:
+            logger.warning(
+                "Requested n_samples (%s) is larger than evaluation dataset size (%s). "
+                "Using full evaluation dataset.",
+                n_samples,
+                total_items,
+            )
+            return None
+        return n_samples
+
+    def _get_or_create_optimization(
+        self, dataset: Dataset, metric: MetricFunction, optimization_id: str | None
+    ) -> Any:
+        """Reuse the given optimization if it exists, otherwise create it with that ID."""
+        opik_optimization = None
+        if optimization_id is not None:
+            try:
+                valid_id = (
+                    isinstance(optimization_id, str)
+                    and UUID(optimization_id).version == 7
+                )
+            except (ValueError, AttributeError, TypeError):
+                valid_id = False
+            if not valid_id:
+                raise ValueError("optimization_id must be a valid UUIDv7 string")
+            try:
+                opik_optimization = self.opik_client.get_optimization_by_id(
+                    optimization_id
+                )
+            except ApiError as e:
+                if e.status_code != 404:
+                    raise
+        if opik_optimization is None:
+            return self._create_optimization_run(dataset, metric, optimization_id)
+        self.current_optimization_id = opik_optimization.id
+        logger.debug(f"Using existing optimization with ID: {opik_optimization.id}")
+        return opik_optimization
+
+    @staticmethod
+    def _resolve_allow_tool_use(
+        optimizable_prompts: dict[str, chat_prompt.ChatPrompt],
+        *,
+        requested: bool,
+        custom_agent: bool,
+    ) -> bool:
+        from .utils.toolcalling.ops import toolcalling as toolcalling_utils
+
+        # A custom agent can own tools no ChatPrompt declares; don't veto it then.
+        declares_tools = any(p.tools for p in optimizable_prompts.values())
+        if declares_tools or not custom_agent:
+            return requested and toolcalling_utils.should_allow_tool_use(
+                optimizable_prompts
+            )
+        return requested
+
     def _resolve_toolcalling(
         self,
         prompt_or_prompts: chat_prompt.ChatPrompt | dict[str, chat_prompt.ChatPrompt],
         *,
         optimize_tools: bool | dict[str, bool] | None = None,
     ) -> tuple[
-        chat_prompt.ChatPrompt | dict[str, chat_prompt.ChatPrompt], list[str] | None
+        chat_prompt.ChatPrompt | dict[str, chat_prompt.ChatPrompt],
+        list[str] | dict[str, list[str]] | None,
     ]:
         """Normalize MCP tool entries into function-calling tools."""
         from .utils.toolcalling.ops.toolcalling import resolve_prompt_tools
@@ -733,63 +851,10 @@ class BaseOptimizer(ABC):
                 if context.should_stop:
                     break
         """
-        prompt_tracing.record_candidate_prompts(prompts)
-        self.pre_trial(context, prompts)
-        try:
-            suppress_progress = bool(
-                (context.extra_params or {}).get("suppress_evaluation_progress", False)
-            )
-            progress_ctx = (
-                nullcontext()
-                if suppress_progress
-                else convert_tqdm_to_rich("  Evaluation", verbose=self.verbose)
-            )
-            with progress_ctx:
-                raw_result = self.evaluate_prompt(
-                    prompt=prompts,
-                    dataset=context.evaluation_dataset,
-                    metric=context.metric,
-                    agent=context.agent,
-                    experiment_config=experiment_config,
-                    n_samples=context.n_samples,
-                    n_samples_strategy=context.n_samples_strategy,
-                    n_threads=normalize_eval_threads(getattr(self, "n_threads", None)),
-                    verbose=self.verbose,
-                    allow_tool_use=context.allow_tool_use,
-                    sampling_tag=sampling_tag,
-                    return_evaluation_result=True,
-                )
-        except Exception:
-            context.finish_reason = "error"
-            context.should_stop = True
-            logger.exception("Evaluation failed; stopping optimization.")
-            raise
-        # raw_result is EvaluationResult (normal path) or float (mocked/legacy path).
-        if isinstance(raw_result, (EvaluationResult, EvaluationResultOnDictItems)):
-            score = self._score_from_evaluation_result(
-                raw_result, metric_name=context.metric.__name__
-            )
-            eval_result_for_health: (
-                EvaluationResult | EvaluationResultOnDictItems | None
-            ) = raw_result
-        else:
-            score = raw_result
-            eval_result_for_health = None
-        coerced_score = self._coerce_score(score)
-        prev_best_score = context.current_best_score
-        self.on_trial(context, prompts, coerced_score, prev_best_score)
-
-        # Update scoring health whenever a new best is recorded.
-        if (
-            prev_best_score is None or coerced_score > prev_best_score
-        ) and eval_result_for_health is not None:
-            context.scoring_health = _compute_scoring_health_from_result(
-                eval_result_for_health, metric_name=context.metric.__name__
-            )
-
-        # Check early stop conditions - SET FLAG, don't raise
-        self._should_stop_context(context)
-        return coerced_score
+        score, _ = self._evaluate_candidate(
+            context, prompts, experiment_config, sampling_tag=sampling_tag
+        )
+        return score
 
     def _score_from_evaluation_result(
         self,
@@ -821,6 +886,32 @@ class BaseOptimizer(ABC):
         sampling_tag: str | None = None,
     ) -> tuple[float, EvaluationResult | EvaluationResultOnDictItems]:
         """Evaluate prompts and return both the score and EvaluationResult."""
+        score, result = self._evaluate_candidate(
+            context,
+            prompts,
+            experiment_config,
+            empty_score=empty_score,
+            n_samples=n_samples,
+            n_samples_strategy=n_samples_strategy,
+            sampling_tag=sampling_tag,
+            require_result=True,
+        )
+        assert isinstance(result, (EvaluationResult, EvaluationResultOnDictItems))
+        return score, result
+
+    def _evaluate_candidate(
+        self,
+        context: OptimizationContext,
+        prompts: dict[str, chat_prompt.ChatPrompt],
+        experiment_config: dict[str, Any] | None = None,
+        *,
+        empty_score: float | None = None,
+        n_samples: int | float | str | None = None,
+        n_samples_strategy: str | None = None,
+        sampling_tag: str | None = None,
+        require_result: bool = False,
+    ) -> tuple[float, EvaluationResult | EvaluationResultOnDictItems | None]:
+        """Score and account for a candidate once, with optional result access."""
         prompt_tracing.record_candidate_prompts(prompts)
         self.pre_trial(context, prompts)
         try:
@@ -833,7 +924,7 @@ class BaseOptimizer(ABC):
                 else convert_tqdm_to_rich("  Evaluation", verbose=self.verbose)
             )
             with progress_ctx:
-                evaluation_result = self.evaluate_prompt(
+                raw_result = self.evaluate_prompt(
                     prompt=prompts,
                     dataset=context.evaluation_dataset,
                     metric=context.metric,
@@ -852,27 +943,41 @@ class BaseOptimizer(ABC):
             context.should_stop = True
             logger.exception("Evaluation failed; stopping optimization.")
             raise
-        if not isinstance(
-            evaluation_result, (EvaluationResult, EvaluationResultOnDictItems)
-        ):
-            raise TypeError("Expected EvaluationResult from evaluate_prompt.")
-        score = self._score_from_evaluation_result(
-            evaluation_result,
-            metric_name=context.metric.__name__,
-            empty_score=empty_score,
-        )
+        # raw_result is EvaluationResult (normal path) or float (mocked/legacy path).
+        if isinstance(raw_result, (EvaluationResult, EvaluationResultOnDictItems)):
+            from .core.reasoning import cases_from_evaluation
+
+            self._reasoning_cases = tuple(
+                cases_from_evaluation(
+                    raw_result.test_results[: self.max_reasoning_examples]
+                )
+            )
+            score = self._score_from_evaluation_result(
+                raw_result, metric_name=context.metric.__name__, empty_score=empty_score
+            )
+            eval_result_for_health: (
+                EvaluationResult | EvaluationResultOnDictItems | None
+            ) = raw_result
+        else:
+            if require_result:
+                raise TypeError("Expected EvaluationResult from evaluate_prompt.")
+            score = raw_result
+            eval_result_for_health = None
         coerced_score = self._coerce_score(score)
         prev_best_score = context.current_best_score
         self.on_trial(context, prompts, coerced_score, prev_best_score)
 
         # Update scoring health whenever a new best is recorded.
-        if prev_best_score is None or coerced_score > prev_best_score:
+        if (
+            prev_best_score is None or coerced_score > prev_best_score
+        ) and eval_result_for_health is not None:
             context.scoring_health = _compute_scoring_health_from_result(
-                evaluation_result, metric_name=context.metric.__name__
+                eval_result_for_health, metric_name=context.metric.__name__
             )
 
+        # Check early stop conditions - SET FLAG, don't raise
         self._should_stop_context(context)
-        return coerced_score, evaluation_result
+        return coerced_score, eval_result_for_health
 
     # ------------------------------------------------------------------
     # Reporting/display
@@ -1223,6 +1328,11 @@ class BaseOptimizer(ABC):
     # Candidate-first aliases
     def begin_round(self, context: OptimizationContext, **extras: Any) -> Any:
         """Alias for pre_round."""
+        warnings.warn(
+            "begin_round is deprecated; use pre_round.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.pre_round(context, **extras)
 
     def start_candidate(
@@ -1233,6 +1343,11 @@ class BaseOptimizer(ABC):
         round_handle: Any | None = None,
     ) -> Any:
         """Alias for pre_trial."""
+        warnings.warn(
+            "start_candidate is deprecated; use pre_trial.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.pre_trial(context, candidate, round_handle=round_handle)
 
     def finish_candidate(
@@ -1251,6 +1366,11 @@ class BaseOptimizer(ABC):
         round_handle: Any | None = None,
     ) -> None:
         """Alias for post_trial."""
+        warnings.warn(
+            "finish_candidate is deprecated; use post_trial.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.post_trial(
             context,
             candidate_handle,
@@ -1615,6 +1735,7 @@ class BaseOptimizer(ABC):
     # Public API
     # ------------------------------------------------------------------
 
+    @llm_calls.bind_optimizer
     def optimize_prompt(
         self,
         prompt: chat_prompt.ChatPrompt | dict[str, chat_prompt.ChatPrompt],
@@ -1642,11 +1763,11 @@ class BaseOptimizer(ABC):
         This method provides the standard optimization flow:
         1. Setup optimization context via _setup_optimization()
         2. Check for early stop if baseline score meets threshold
-        3. Run the algorithm-specific optimization via _run_optimization()
+        3. Run the algorithm-specific optimization via run_optimization()
         4. Finalize and update status via _finalize_optimization()
 
         Subclasses can override this method for custom behavior, but most
-        should only need to implement _run_optimization().
+        should only need to implement run_optimization().
 
         Args:
            prompt: The prompt to optimize (single ChatPrompt or dict of prompts)
@@ -1662,7 +1783,8 @@ class BaseOptimizer(ABC):
                TODO: keep internal until the strategy set is stabilized.
            auto_continue: Whether to continue optimization automatically
            project_name: Opik project name for logging traces (defaults to OPIK_PROJECT_NAME env or "Optimization")
-           optimization_id: Optional ID to use when creating the Opik optimization run
+           optimization_id: Optional ID of the Opik optimization run to log to. An existing
+               run is reused; otherwise one is created with this ID (must be a valid UUIDv7).
            validation_dataset: Optional validation dataset for ranking candidates
            max_trials: Maximum number of optimization trials
            allow_tool_use: Whether tools may be executed during evaluation (default True)
@@ -1861,6 +1983,11 @@ class BaseOptimizer(ABC):
         selection_meta: dict[str, Any] | None = None,
     ) -> None:
         """Alias for post_round."""
+        warnings.warn(
+            "finish_round is deprecated; use post_round.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.post_round(
             round_handle,
             context=context,
