@@ -28,6 +28,9 @@ public record ModelParams(
         ToolsParam tools,
         Boolean samplingExclusive,
         Boolean thinksByDefault,
+        // Set when the provider refuses the model on every other route. Requests still follow the key's route,
+        // so a Responses-only model on a Chat Completions key gets the provider's error; the live check reads it.
+        String onlyRoute,
         Map<String, ModelParams> routes) {
 
     public static final String RESPONSES_API_ROUTE = "responses_api";
@@ -163,6 +166,7 @@ public record ModelParams(
                 ToolsParam.overlay(base.tools, top.tools),
                 ObjectUtils.getIfNull(top.samplingExclusive, base.samplingExclusive),
                 ObjectUtils.getIfNull(top.thinksByDefault, base.thinksByDefault),
+                ObjectUtils.getIfNull(top.onlyRoute, base.onlyRoute),
                 overlayRoutes(base.routes, top.routes));
     }
 
@@ -208,6 +212,7 @@ public record ModelParams(
                 tools == null ? null : tools.settled(),
                 samplingExclusive,
                 thinksByDefault,
+                onlyRoute,
                 routes);
     }
 }

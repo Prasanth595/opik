@@ -14,13 +14,18 @@ params the backend serves (GET /v1/private/llm/models) and calls the model throu
   effort X    once per effort level the catalog offers
 
 OpenAI models are called on Chat Completions and again on the Responses API, since a route can refuse what the
-model takes. When the plain call fails, the rest of that model's calls on that route are skipped. A provider error
-that names a setting is a rejected claim, and the call goes again without it, so one wrong value does not hide the
-others. Report-only: a failure is a result for a person to read, not an error. The exit code is non-zero only when
-the check itself could not run.
+model takes; a model whose params name an only_route is called on that route alone. When the plain call fails, the
+rest of that model's calls on that route are skipped. A provider error that names a setting is a rejected claim, and
+the call goes again without it, so one wrong value does not hide the others. Report-only: a failure is a result for
+a person to read, not an error. The exit code is non-zero only when the check itself could not run.
 
-When nothing changed, it checks one cheap model per provider instead (from SMOKE_MODELS, when that model is in
-the registry), so a PR that touches only this script or its workflow still runs end to end.
+A changed model that no picker offers (the backend serves it without a label) is listed as not checked rather than
+called: nobody can pick it, and most such models are retired, not chat models, or a dated copy of a listed one, so a
+failure there is one nobody acts on. A model past its provider's retirement date (read the way the sync reads it) is
+listed as retired, picker or not. --models still calls both.
+
+When nothing changed, it checks one cheap model per provider instead (the first in SMOKE_MODELS that is in the
+registry and not retired), so a PR that touches only this script or its workflow still runs end to end.
 
 Usage:
   python scripts/check_new_models.py --base-ref origin/main --dry-run --catalog-file models.json
@@ -41,6 +46,7 @@ from urllib.parse import urlparse
 
 import requests
 import yaml
+from sync_provider_models import build_deprecated_by_provider, load_model_prices
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LLM_MODELS_YAML = Path("apps/opik-backend/src/main/resources/llm-models-default.yaml")
@@ -72,11 +78,14 @@ PROVIDER_LABELS = {
 
 REASON_PRIORITY = {"new": 0, "changed": 1, "params": 2}
 OVER_CAP_NOTE = "over the call cap"
+NOT_IN_PICKER_NOTE = "not in a picker"
+RETIRED_NOTE = "retired"
 
 SMOKE_MODELS = {
-    "openai": "gpt-4.1-nano",
-    "anthropic": "claude-haiku-4-5-20251001",
-    "gemini": "gemini-2.5-flash-lite",
+    # gpt-4o-mini first: a model without reasoning takes the sampling settings, so the smoke run still sends them.
+    "openai": ("gpt-4o-mini", "gpt-5-nano"),
+    "anthropic": ("claude-haiku-4-5-20251001",),
+    "gemini": ("gemini-2.5-flash-lite",),
 }
 
 # The fields that change what the backend sends or where it routes a plain prompt. Others, such
@@ -84,6 +93,7 @@ SMOKE_MODELS = {
 CALL_FIELDS = ("qualifiedName", "structuredOutput", "reasoning")
 
 ROUTES = {"openai": (None, "responses_api")}
+CHAT_COMPLETIONS_ROUTE = "chat_completions_api"
 ROUTE_KEY_CONFIGURATION = {"responses_api": {"openai_pipeline_mode": "responses_api"}}
 ROUTE_LABELS = {None: "Chat Completions", "responses_api": "Responses"}
 
@@ -241,12 +251,17 @@ def find_models_to_check(
         for model_id, (row, curated_row) in _rows_by_id(head_registry, head_curated, provider).items():
             model = _merged_row(row, curated_row)
             before = base_rows.get(model_id)
+            # Gaining onlyRoute only takes routes away and changes no request the backend sends, so it alone is no
+            # reason to call a model again. Losing or changing it opens a route the check hasn't called.
+            gained_only_route = (
+                before is not None and _only_route(*before) is None and _only_route(row, curated_row) is not None
+            )
             if before is None:
                 reason = "new"
             elif _call_fields(_merged_row(*before)) != _call_fields(model):
                 reason = "changed"
-            elif _params_inputs(base_curated, provider, *before) != _params_inputs(
-                head_curated, provider, row, curated_row
+            elif _params_inputs(base_curated, provider, *before, gained_only_route) != _params_inputs(
+                head_curated, provider, row, curated_row, gained_only_route
             ):
                 reason = "params"
             else:
@@ -278,7 +293,9 @@ def _merged_row(row: dict | None, curated_row: dict | None) -> dict:
     return {**(row or {}), **{k: v for k, v in (curated_row or {}).items() if k != "params"}}
 
 
-def _params_inputs(curated: dict, provider: str, row: dict | None, curated_row: dict | None) -> tuple:
+def _params_inputs(
+    curated: dict, provider: str, row: dict | None, curated_row: dict | None, without_only_route: bool = False
+) -> tuple:
     # Every input the backend folds into a model's params, compared as a whole rather than merged here: a second
     # copy of the merge would be one more place for the rules to drift.
     defaults = curated["defaults"].get(provider) or {}
@@ -286,11 +303,18 @@ def _params_inputs(curated: dict, provider: str, row: dict | None, curated_row: 
     names = [defaults.get("profile"), defaults.get("reasoningProfile") if reasoning else None]
     names += [(row or {}).get("profile"), (curated_row or {}).get("profile")]
     profiles = tuple((name, json.dumps(curated["profiles"].get(name), sort_keys=True)) for name in names if name)
-    return (
-        json.dumps((row or {}).get("params"), sort_keys=True),
-        json.dumps((curated_row or {}).get("params"), sort_keys=True),
-        profiles,
-    )
+    params = [(row or {}).get("params"), (curated_row or {}).get("params")]
+    if without_only_route:
+        params = [{k: v for k, v in p.items() if k != "onlyRoute"} if isinstance(p, dict) else p for p in params]
+    return (*(json.dumps(p, sort_keys=True) for p in params), profiles)
+
+
+def _only_route(row: dict | None, curated_row: dict | None) -> str | None:
+    for source in (curated_row, row):
+        params = (source or {}).get("params")
+        if isinstance(params, dict) and params.get("onlyRoute") is not None:
+            return params["onlyRoute"]
+    return None
 
 
 def _call_fields(model: dict) -> tuple:
@@ -313,20 +337,42 @@ def _flag(value) -> bool:
     return False
 
 
-def smoke_models(head: dict[str, list[dict]]) -> list[ModelToCheck]:
+def smoke_models(head: dict[str, list[dict]], retired: dict[str, set[str]]) -> list[ModelToCheck]:
     to_check = []
-    for provider, model_id in SMOKE_MODELS.items():
-        model = next((m for m in head.get(provider, []) if m["id"] == model_id), None)
-        if model is not None:
-            to_check.append(ModelToCheck(provider, model_id, request_model_name(model), "smoke"))
+    for provider, candidates in SMOKE_MODELS.items():
+        for model_id in candidates:
+            row = next((m for m in head.get(provider, []) if m["id"] == model_id), None)
+            model = row and ModelToCheck(provider, model_id, request_model_name(row), "smoke")
+            if model and not is_retired(model, retired):
+                to_check.append(model)
+                break
     return to_check
+
+
+def retired_models() -> dict[str, set[str]]:
+    # Read the way the sync reads them, so the check and the picker agree on which models are gone.
+    return build_deprecated_by_provider(load_model_prices())
+
+
+def is_retired(model: ModelToCheck, retired: dict[str, set[str]]) -> bool:
+    if model.provider == "vertex-ai":
+        return model.request_model in retired.get("vertexai", set())
+    return model.model_id in retired.get(model.provider, set())
 
 
 def plan_probes(model: ModelToCheck, params: dict | None) -> list[Probe]:
     if not params:
         return [Probe(model, None, "plain", {"max_completion_tokens": MAX_COMPLETION_TOKENS}, ())]
     probes = []
-    for route in ROUTES.get(model.provider, (None,)):
+    routes = ROUTES.get(model.provider, (None,))
+    only_route = params.get("only_route")
+    if only_route is not None and only_route not in [route or CHAT_COMPLETIONS_ROUTE for route in routes]:
+        raise ValueError(
+            f"{model.provider}/{model.model_id} has only_route {only_route!r}, which names none of its routes"
+        )
+    for route in routes:
+        if only_route is not None and (route or CHAT_COMPLETIONS_ROUTE) != only_route:
+            continue
         route_params = params if route is None else (params.get("routes") or {}).get(route, params)
         probes += _route_probes(model, route, route_params)
     return probes
@@ -590,7 +636,8 @@ def render_report(
         "through the backend with the params its API serves: once plain, then with the numbers at the top and the "
         "bottom of their ranges (only one of temperature and top_p for a model that takes one at a time), with the "
         "settings it refuses, and once per effort level that sets a request field (not the Gemini and Vertex AI "
-        "`auto` or `none` levels). Resending without a rejected setting counts toward the call cap. A `refused` call "
+        "`auto` or `none` levels). An OpenAI model the catalog serves on one route only (`only_route`) is called on "
+        "that route alone. Resending without a rejected setting counts toward the call cap. A `refused` call "
         "passes when the backend leaves those settings out or when the provider takes them anyway, so it fails only "
         "when they reach a provider that rejects them. A failure is for a person to read: it can be a real gap in "
         "the model data, or a provider-side limit."
@@ -764,7 +811,9 @@ def _provider_order(items: list) -> list[str]:
     return sorted(seen, key=lambda p: rank.get(p, len(rank)))
 
 
-def plan(args: argparse.Namespace) -> tuple[list[ModelToCheck], list[UnexercisedChange], str]:
+def plan(
+    args: argparse.Namespace, retired: dict[str, set[str]]
+) -> tuple[list[ModelToCheck], list[UnexercisedChange], str]:
     head = load_catalog(args.head_ref)
     if args.models:
         rows = {(p, m["id"]): m for p, models in head[0].items() for m in models}
@@ -781,11 +830,12 @@ def plan(args: argparse.Namespace) -> tuple[list[ModelToCheck], list[Unexercised
     to_check, unexercised = find_models_to_check(load_catalog(args.base_ref), head)
     if to_check:
         return to_check, unexercised, "changes"
-    return smoke_models(head[0]), unexercised, "smoke"
+    return smoke_models(head[0], retired), unexercised, "smoke"
 
 
 def run(args: argparse.Namespace) -> int:
-    to_check, unexercised, mode = plan(args)
+    retired = retired_models()
+    to_check, unexercised, mode = plan(args, retired)
     keys = {p: os.environ.get(env, "") for p, env in PROVIDER_KEY_ENV.items()}
     secrets = [k for k in keys.values() if k]
 
@@ -804,6 +854,10 @@ def run(args: argparse.Namespace) -> int:
         probes = plan_probes(model, (served or {}).get("params"))
         if served is None:
             results += [CheckResult(p, "not checked", None, "the backend doesn't list this model") for p in probes]
+        elif mode != "asked" and is_retired(model, retired):
+            results += [CheckResult(p, "not checked", None, RETIRED_NOTE) for p in probes]
+        elif mode == "changes" and not served.get("label"):
+            results += [CheckResult(p, "not checked", None, NOT_IN_PICKER_NOTE) for p in probes]
         elif not keys.get(model.provider):
             results += [CheckResult(p, "not checked", None, "no CI key") for p in probes]
         else:
