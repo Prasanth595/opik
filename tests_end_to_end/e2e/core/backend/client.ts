@@ -63,6 +63,39 @@ export interface InsightsViewRef {
   scope: string | null;
 }
 
+/**
+ * One section of an insights view's stored `config`, as the project Dashboards
+ * page reads it back.
+ *
+ * `widgetTitles` rather than the widgets themselves: what a copy-of-a-template
+ * assertion needs to know is which widgets landed in which section and in what
+ * order, and a title is the only part of a widget a reader of the page can also
+ * see. `id` is carried because it is the subject of its own assertion — the copy
+ * builder runs the template through `regenerateAllIds`, so a copy that kept the
+ * template's `template-section-N` ids would be sharing ids with every other
+ * copy in the workspace.
+ */
+export interface InsightsViewSectionRef {
+  id: string;
+  title: string;
+  widgetTitles: string[];
+}
+
+/**
+ * An insights view read back BY ID, with its stored `config` decoded.
+ *
+ * Separate from `InsightsViewRef`, which is what the list read returns: the list
+ * carries no config, and a spec asserting what a widget-save actually persisted
+ * has to read the sections. `type` is carried for the same reason `scope` is on
+ * `InsightsViewRef` — the project page's view picker filters on
+ * `type: multi_project`, so a copy stored with any other type exists but is
+ * unreachable from the UI that made it.
+ */
+export interface InsightsViewDetail extends InsightsViewRef {
+  type: string | null;
+  sections: InsightsViewSectionRef[];
+}
+
 export interface DatasetRef {
   id: string;
   name: string;
@@ -365,6 +398,27 @@ export interface ExperimentRefDetail {
   id: string;
   name: string;
   datasetId: string | null;
+}
+
+/**
+ * An experiment's lifecycle, read off `GET /v1/private/experiments/{id}`.
+ *
+ * `status` and `finishedAt` are the pair `/experiments/cancel` writes, and the
+ * two counts are what a stopped run is read against: `datasetItemCount` is how
+ * many of the dispatched items produced an experiment item, so
+ * `totalItems - datasetItemCount` is how many the stop prevented.
+ *
+ * Every field is nullable because the wire genuinely omits each one in some
+ * state (`finished_at` while a run may still produce items, `status` on a row
+ * written before the column existed) — a caller asserts the absence away
+ * rather than comparing against a substituted default.
+ */
+export interface ExperimentLifecycle {
+  status: string | null;
+  finishedAt: string | null;
+  createdAt: string | null;
+  datasetItemCount: number | null;
+  traceCount: number | null;
 }
 
 export interface ExecutePromptSeed {
@@ -757,6 +811,14 @@ export interface TraceBatchSeed {
    * round trips and the quickest route to the workspace ingestion rate limit.
    */
   threadId?: string;
+  /**
+   * The trace's `environment` tag, as `createTraceWithSource` takes it.
+   *
+   * Sent only when supplied: a trace with no `environment` is the "Untagged"
+   * case the Logs environment filter has its own `is_empty` branch for, so an
+   * absent value and a present one are different seeds.
+   */
+  environment?: string;
 }
 
 /**
@@ -1216,6 +1278,18 @@ export interface AutomationRuleEvaluatorPageRef {
  */
 export type TraceJsonSection = Record<string, unknown> | unknown[] | string | number;
 
+/**
+ * One row of `GET /v1/private/environments` — a name the workspace knows.
+ *
+ * Only the id and the name: the id is what the delete endpoint takes, and the
+ * name is what a trace carries and what the dropdown and the `environment`
+ * query param are keyed on. The colour and position are presentation.
+ */
+export interface EnvironmentRef {
+  id: string;
+  name: string;
+}
+
 export interface AnnotationQueueReviewerRef {
   username: string;
   itemsScored: number;
@@ -1401,6 +1475,29 @@ export function numericStat(value: ThreadStatValue | undefined, name: string): n
     );
   }
   return value;
+}
+
+/**
+ * One item of the project home page's "Recent activity" list.
+ *
+ * `type` and `name` are plain strings rather than a narrowed union: the list is
+ * an open set the backend adds to (seven `ActivityType`s today), and a spec
+ * about one of them wants an unknown new type to arrive and be counted, not to
+ * fail type-checking or be silently dropped.
+ */
+export interface RecentActivityItemRef {
+  /** `trace_daily`, `experiment`, `dataset_version`, … */
+  type: string;
+  /** The rendered right-hand value. For `trace_daily` this is the COUNT. */
+  name: string;
+  id: string;
+  createdAt: string;
+}
+
+/** The `GET /projects/{id}/activities` envelope, `total` included. */
+export interface RecentActivityPageRef {
+  total: number;
+  items: RecentActivityItemRef[];
 }
 
 /** A backend filter as the REST layer serialises it (the `filters` query param). */
@@ -2175,6 +2272,55 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
         projectId: d.projectId ?? null,
         scope: d.scope ?? null,
       }));
+    },
+
+    /**
+     * `GET /v1/private/insights-views/{id}` — the read a shared link resolves,
+     * and the only one that carries the stored `config`.
+     *
+     * Returns null for a view that is not there, so a caller can assert a
+     * deletion took effect; anything else throws. The config is decoded into
+     * `sections` here rather than handed back raw, because `config` is a
+     * `JsonNode` on the wire and every caller wants the same three facts out of
+     * it — the section order, each section's id, and which widgets are in it.
+     *
+     * A section the backend stored without `widgets` comes back as an empty
+     * list rather than being skipped: "the section exists and holds nothing" and
+     * "the section is missing" are different failures, and a spec comparing
+     * widget counts per section must be able to tell them apart.
+     */
+    async getInsightsView(id: string): Promise<InsightsViewDetail | null> {
+      try {
+        const view = await withReadRetry(() => opik.api.insightsViews.getInsightsViewById(id));
+        const config = (view.config ?? {}) as {
+          sections?: Array<{
+            id?: unknown;
+            title?: unknown;
+            widgets?: Array<{ title?: unknown; generatedTitle?: unknown }>;
+          }>;
+        };
+        return {
+          id: String(view.id ?? ''),
+          name: view.name,
+          projectId: view.projectId ?? null,
+          scope: view.scope ?? null,
+          type: view.type ?? null,
+          sections: (config.sections ?? []).map((section) => ({
+            id: String(section.id ?? ''),
+            title: String(section.title ?? ''),
+            // A widget's own `title` when it has one, the title the app
+            // generated for it otherwise — the config stores both, and the
+            // header renders `title || generatedTitle`, so this is the string a
+            // reader of the page would see.
+            widgetTitles: (section.widgets ?? []).map((widget) =>
+              String(widget.title || widget.generatedTitle || ''),
+            ),
+          })),
+        };
+      } catch (err) {
+        if (isNotFoundError(err)) return null;
+        throw err;
+      }
     },
 
     /**
@@ -3740,6 +3886,102 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
           previousValue: stat.previous_value ?? null,
         })),
       };
+    },
+
+    /**
+     * `GET /v1/private/projects/{id}/activities` — the read behind the project
+     * home page's "Recent activity" list.
+     *
+     * The whole envelope, items verbatim: the list merges six sources in one
+     * response, so a caller asserting on one of them has to be able to see
+     * that the others did not also change. `total` comes back for the same
+     * reason the other paged reads return it — an item silently dropped from
+     * `content` is otherwise indistinguishable from one that was never there.
+     *
+     * `name` is a plain string even for `trace_daily`, where it carries a
+     * COUNT (`RecentActivityService.toTraceDailyItem` stringifies it). Left as
+     * the server spells it rather than parsed to a number here: the front end
+     * renders the string, so a spec comparing the page against this read is
+     * comparing like with like, and a count that came back as `"3.0"` or
+     * `"3 traces"` fails instead of being normalised into agreement.
+     *
+     * Through `rawFetch` because the pinned SDK has no recent-activity surface
+     * at all.
+     */
+    async listRecentActivity(args: {
+      projectId: string;
+      page?: number;
+      size?: number;
+    }): Promise<RecentActivityPageRef> {
+      const { status, message, json } = await rawFetch(
+        'GET',
+        `/v1/private/projects/${args.projectId}/activities`,
+        {
+          query: new URLSearchParams({
+            page: String(args.page ?? 1),
+            size: String(args.size ?? 10),
+          }),
+        },
+      );
+      if (status !== 200) {
+        throw new Error(
+          `listRecentActivity(project ${args.projectId}): expected 200, got ${status}: ${message}`,
+        );
+      }
+      const body = (json ?? {}) as {
+        total?: number;
+        content?: Array<Record<string, unknown>>;
+      };
+      if (typeof body.total !== 'number') {
+        throw new Error(
+          `listRecentActivity(project ${args.projectId}): 200 response carried no numeric ` +
+            "'total' — the envelope is where a dropped item shows up, so it cannot be assumed.",
+        );
+      }
+      return {
+        total: body.total,
+        items: (body.content ?? []).map((item) => {
+          // Asserted, not defaulted: an item with no type or no name is a
+          // malformed response, and coercing it to '' would turn that into an
+          // item the caller simply filters out.
+          if (typeof item.type !== 'string' || typeof item.name !== 'string') {
+            throw new Error(
+              `listRecentActivity(project ${args.projectId}): an activity item arrived ` +
+                `without a string type/name: ${JSON.stringify(item)}`,
+            );
+          }
+          return {
+            type: item.type,
+            name: item.name,
+            id: String(item.id ?? ''),
+            createdAt: String(item.created_at ?? ''),
+          };
+        }),
+      };
+    },
+
+    /**
+     * `GET /v1/private/toggles/` — the feature-toggle map the front end reads
+     * on boot, so a spec can tell "this deployment does not offer the surface"
+     * from "the surface is broken".
+     *
+     * Needed because a toggled-off surface does not fail visibly: a route
+     * behind one redirects to its fallback, and a spec that then waits for the
+     * gated page's own heading times out with no hint that the feature was
+     * simply off. `project_homepage_enabled` is the live example — it defaults
+     * to `false`, so `/projects/{id}/home` replaces itself with `/logs`.
+     *
+     * Returns `false` for a key the deployment does not report at all, which is
+     * the same answer the front end's own `DEFAULT_STATE` merge gives an older
+     * backend: absent means not offered.
+     */
+    async isFeatureToggleEnabled(key: string): Promise<boolean> {
+      const { status, message, json } = await rawFetch('GET', '/v1/private/toggles/');
+      if (status !== 200) {
+        throw new Error(`isFeatureToggleEnabled(${key}): expected 200, got ${status}: ${message}`);
+      }
+      const toggles = (json ?? {}) as Record<string, unknown>;
+      return toggles[key] === true;
     },
 
     /**
@@ -6433,6 +6675,68 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
     },
 
     /**
+     * `PUT /v1/private/experiments/cancel` — the stop a Playground or
+     * test-suite run takes, reporting the status rather than throwing on it.
+     *
+     * The status is deliberately returned: a `204` here does NOT mean anything
+     * was stopped. `ExperimentExecutionService.stillRunning` filters the ids
+     * down to the ones `itemPublisher.isTracked` still holds AND whose status
+     * is non-terminal, and answers an empty `Mono` — i.e. the same 204 — when
+     * that set is empty. So a caller that reads the status as confirmation is
+     * asserting nothing; the claim has to be made against the experiment's own
+     * status afterwards, which is what `getExperimentLifecycle` below is for.
+     */
+    async cancelExperiments(ids: string[]): Promise<RawApiResult> {
+      const { status, message, location } = await rawFetch(
+        'PUT',
+        '/v1/private/experiments/cancel',
+        { body: { ids } },
+      );
+      return { status, message, location };
+    },
+
+    /**
+     * An experiment's lifecycle as the wire carries it: `status`, `finished_at`
+     * and the two item counts a stopped run is read against.
+     *
+     * Raw rather than through the pinned SDK, which predates both fields —
+     * `opik@2.2.74` has no `status` and no `finished_at` on `Experiment`, so
+     * going through `opik.api.experiments.getExperimentById` would silently
+     * drop exactly what a caller asks this for and leave a lifecycle assertion
+     * comparing `undefined` with `undefined`.
+     *
+     * Every field is read as "absent" rather than defaulted. `status: null` and
+     * `finishedAt: null` are facts a caller must assert away before comparing —
+     * a `?? 'completed'` here would reproduce the backend's own
+     * `ExperimentStatus.fromString` fallback inside the test and make a dropped
+     * status read as a healthy one.
+     */
+    async getExperimentLifecycle(id: string): Promise<ExperimentLifecycle> {
+      const { status, message, json } = await rawFetch(
+        'GET',
+        `/v1/private/experiments/${id}`,
+      );
+      if (status !== 200) {
+        throw new Error(`GET /v1/private/experiments/${id} -> ${status}: ${message}`);
+      }
+      const body = (json ?? {}) as {
+        status?: unknown;
+        finished_at?: unknown;
+        created_at?: unknown;
+        dataset_item_count?: unknown;
+        trace_count?: unknown;
+      };
+      return {
+        status: typeof body.status === 'string' ? body.status : null,
+        finishedAt: typeof body.finished_at === 'string' ? body.finished_at : null,
+        createdAt: typeof body.created_at === 'string' ? body.created_at : null,
+        datasetItemCount:
+          typeof body.dataset_item_count === 'number' ? body.dataset_item_count : null,
+        traceCount: typeof body.trace_count === 'number' ? body.trace_count : null,
+      };
+    },
+
+    /**
      * `POST /v1/private/experiments/delete` for SEVERAL ids at once, reporting
      * the status instead of throwing on it.
      *
@@ -6468,6 +6772,14 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
      * absence is the point; a defaulted `'sdk'` would quietly turn the legacy
      * case into the ordinary one.
      *
+     * The union is every value `api.Source` admits on ingest, `evaluator`
+     * included — the whole enum, deliberately, because a spec whose subject is
+     * an `= sdk` filter has to be able to seed EVERY value that filter is
+     * supposed to exclude. A union missing one leaves that value untested and
+     * reads as though the enum were shorter than it is. `unknown` is absent
+     * here for the same reason it is absent from the enum: the endpoint refuses
+     * it on ingest, and `source: null` is how a caller writes that row.
+     *
      * Written through `rawFetch` rather than the pinned SDK because the SDK
      * validates the request body against `JsonListStringWrite`, which admits an
      * object, an array OF OBJECTS, or a string — while the endpoint itself
@@ -6480,7 +6792,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       id: string;
       projectName: string;
       name: string;
-      source: 'sdk' | 'experiment' | 'playground' | 'optimization' | null;
+      source: 'sdk' | 'experiment' | 'playground' | 'optimization' | 'evaluator' | null;
       input?: TraceJsonSection;
       output?: TraceJsonSection;
       metadata?: Record<string, unknown>;
@@ -6506,6 +6818,16 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
        * supply its own.
        */
       errorInfo?: { exceptionType: string; message: string; traceback: string };
+      /**
+       * The trace's `environment` tag — the column the Logs tabs' environment
+       * filter matches on (opik#9177), and the name the backend registers in
+       * the workspace's environment list when it first sees it.
+       *
+       * Deliberately not defaulted: a trace written with no `environment` is
+       * the "Untagged" case the filter has its own branch for, so "absent" and
+       * "some string" are different seeds and the caller has to say which.
+       */
+      environment?: string;
     }): Promise<string> {
       await postSeedWrite('/v1/private/traces', `createTraceWithSource '${args.name}'`, {
         id: args.id,
@@ -6513,6 +6835,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
         name: args.name,
         ...(args.source === null ? {} : { source: args.source }),
         ...(args.threadId ? { thread_id: args.threadId } : {}),
+        ...(args.environment === undefined ? {} : { environment: args.environment }),
         start_time: (args.startTime ?? new Date()).toISOString(),
         ...(args.endTime ? { end_time: args.endTime.toISOString() } : {}),
         ...(args.errorInfo
@@ -6569,6 +6892,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
             end_time: (trace.endTime ?? now).toISOString(),
             source: 'sdk' as const,
             ...(trace.threadId ? { thread_id: trace.threadId } : {}),
+            ...(trace.environment === undefined ? {} : { environment: trace.environment }),
             ...(trace.input === undefined ? {} : { input: trace.input }),
             ...(trace.output === undefined ? {} : { output: trace.output }),
             ...(trace.metadata === undefined ? {} : { metadata: trace.metadata }),
@@ -6790,8 +7114,15 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
        * is what a seed wants when the experiment must look like one still being
        * written to. Like `evaluationMethod`, the pinned SDK has no field for
        * it, so setting either takes the raw write.
+       *
+       * `failed` is the member opik#9211's regen added to `ExperimentStatus`,
+       * and it is in the union for the same reason the other three are: the
+       * only way to ask a client whether it can read a status is to store one.
+       * It is not reachable by seeding a run that fails, either — a run whose
+       * items all error still has to be waited out, and what it lands on is
+       * the product's decision rather than the seed's.
        */
-      status?: 'running' | 'completed' | 'cancelled';
+      status?: 'running' | 'completed' | 'cancelled' | 'failed';
     }): Promise<string> {
       if (args.evaluationMethod !== undefined || args.status !== undefined) {
         await postSeedWrite(
@@ -6912,6 +7243,52 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       } catch (err) {
         if (isNotFoundError(err)) return;
         throw err;
+      }
+    },
+
+    /**
+     * The workspace's environment registry — `GET /v1/private/environments`,
+     * the list the Logs tabs' environment dropdown is built from.
+     *
+     * Workspace-scoped, and auto-populated: the backend registers a name the
+     * first time a trace is written carrying it. A fixture that seeds traces
+     * under a new environment therefore has to poll this (the registration is
+     * asynchronous) and delete what it caused to exist — environments cascade
+     * with neither a project nor the run-prefix sweep in `global-teardown.ts`.
+     */
+    async listEnvironments(): Promise<EnvironmentRef[]> {
+      const { status, message, json } = await rawFetch('GET', '/v1/private/environments');
+      if (status !== 200) {
+        throw new Error(`listEnvironments(): expected 200, got ${status}: ${message}`);
+      }
+      const content = (json as { content?: unknown } | null)?.content;
+      if (!Array.isArray(content)) {
+        throw new Error("listEnvironments(): 200 response carried no 'content' array.");
+      }
+      return content.map((raw) => {
+        const env = raw as { id?: unknown; name?: unknown };
+        return { id: String(env.id ?? ''), name: String(env.name ?? '') };
+      });
+    },
+
+    /**
+     * `POST /v1/private/environments/delete` — the only way an environment
+     * leaves the workspace.
+     *
+     * Takes ids a caller resolved from {@link listEnvironments} by name, so a
+     * fixture can delete the names it registered and nothing else: the
+     * workspace is shared, and sweeping by anything looser would take
+     * environments another run (or a human) is relying on.
+     */
+    async deleteEnvironments(ids: string[]): Promise<void> {
+      if (ids.length === 0) return;
+      const { status, message } = await rawFetch('POST', '/v1/private/environments/delete', {
+        body: { ids },
+      });
+      if (status !== 204 && status !== 200) {
+        throw new Error(
+          `deleteEnvironments(${ids.join(', ')}): expected 204, got ${status}: ${message}`,
+        );
       }
     },
 
@@ -7045,6 +7422,74 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
             };
           }),
         ),
+      };
+    },
+
+    /**
+     * Store (or clear) a queue's custom annotator view — the `annotator_view`
+     * block opik#9079 added, through `PATCH /annotation-queues/{id}`.
+     *
+     * Written over `rawFetch` because the pinned SDK's queue types do not
+     * declare `annotator_view` at all: a write through the typed client would
+     * drop the field and report a queue that stored nothing exactly like one
+     * that stored the view.
+     *
+     * The caller passes the `html` verbatim. There is no "delete" verb — the
+     * backend's `serializeAnnotatorView` stores null for a blank `html`, so
+     * `html: ''` is how a view is removed, and that asymmetry is itself worth a
+     * spec rather than something to paper over here.
+     */
+    async setAnnotationQueueAnnotatorView(
+      queueId: string,
+      view: { html: string; kitVersion?: number; summary?: string },
+    ): Promise<void> {
+      const { status, message } = await rawFetch(
+        'PATCH',
+        `/v1/private/annotation-queues/${queueId}`,
+        {
+          body: {
+            annotator_view: {
+              html: view.html,
+              ...(view.kitVersion === undefined ? {} : { kit_version: view.kitVersion }),
+              ...(view.summary === undefined ? {} : { summary: view.summary }),
+            },
+          },
+        },
+      );
+      if (status !== 204) {
+        throw new Error(
+          `setAnnotationQueueAnnotatorView('${queueId}'): expected 204, got ${status}: ${message}`,
+        );
+      }
+    },
+
+    /**
+     * A queue's stored `annotator_view`, or null when it carries none.
+     *
+     * Read through `rawFetch` for the same reason the write is: the typed
+     * client would silently drop the field. `null` means the key was genuinely
+     * absent or stored as null — never a default, because "it read back as no
+     * view at all" is one of the things a spec asserts.
+     */
+    async getAnnotationQueueAnnotatorView(
+      queueId: string,
+    ): Promise<{ html: string | null; kitVersion: number | null; summary: string | null } | null> {
+      const { status, message, json } = await rawFetch(
+        'GET',
+        `/v1/private/annotation-queues/${queueId}`,
+      );
+      if (status !== 200) {
+        throw new Error(
+          `getAnnotationQueueAnnotatorView('${queueId}'): expected 200, got ${status}: ${message}`,
+        );
+      }
+      const view = (json as { annotator_view?: unknown } | null)?.annotator_view;
+      if (view === undefined || view === null) return null;
+      const raw = view as { html?: unknown; kit_version?: unknown; summary?: unknown };
+      return {
+        html: typeof raw.html === 'string' ? raw.html : null,
+        kitVersion: typeof raw.kit_version === 'number' ? raw.kit_version : null,
+        summary: typeof raw.summary === 'string' ? raw.summary : null,
       };
     },
 
